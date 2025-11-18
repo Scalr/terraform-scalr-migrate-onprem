@@ -17,8 +17,8 @@ import time
 from packaging import version
 
 # Check Python version
-if sys.version_info < (3, 12):
-    sys.exit("Python 3.12 or higher is required")
+if sys.version_info < (3, 8):
+    sys.exit("Python 3.8 or higher is required")
 
 # Constants
 MAX_TERRAFORM_VERSION = "1.5.7"
@@ -79,12 +79,17 @@ def make_request(
 
 @dataclass
 class MigratorArgs:
+    # Destination SaaS Scalr
     scalr_hostname: str
     scalr_token: str
-    tfc_hostname: str
-    tfc_token: str
-    tfc_organization: str
     scalr_environment: str
+    
+    # Source on-prem Scalr
+    source_scalr_hostname: str
+    source_scalr_token: str
+    source_scalr_environment: str
+    
+    # Migration options
     vcs_name: Optional[str]
     pc_name: Optional[str]
     workspaces: str
@@ -94,7 +99,6 @@ class MigratorArgs:
     agent_pool_name: Optional[str] = None
     account_id: Optional[str] = None
     lock: bool = True
-    tfc_project: Optional[str] = None
     management_env_name: str = DEFAULT_MANAGEMENT_ENV_NAME
     disable_deletion_protection: bool = False
     debug_enabled: bool = os.getenv("SCALR_DEBUG_ENABLED", False)
@@ -103,27 +107,26 @@ class MigratorArgs:
     @classmethod
     def from_argparse(cls, args: argparse.Namespace) -> 'MigratorArgs':
         if not args.scalr_environment:
-            args.scalr_environment = args.tfc_project if args.tfc_project else args.tfc_organization
+            args.scalr_environment = args.source_scalr_environment
 
         return cls(
             scalr_hostname=args.scalr_hostname,
             scalr_token=args.scalr_token,
             scalr_environment=args.scalr_environment,
-            tfc_hostname=args.tfc_hostname,
-            tfc_token=args.tfc_token,
-            tfc_organization=args.tfc_organization,
-            tfc_project=args.tfc_project,
-            vcs_name=args.vcs_name,
-            pc_name=args.pc_name,
-            agent_pool_name=args.agent_pool_name,
-            workspaces=args.workspaces or "*",
-            skip_workspace_creation=args.skip_workspace_creation,
-            skip_backend_secrets=args.skip_backend_secrets,
-            lock=not args.skip_tfc_lock,
-            management_env_name=args.management_env_name,
+            source_scalr_hostname=args.source_scalr_hostname,
+            source_scalr_token=args.source_scalr_token,
+            source_scalr_environment=args.source_scalr_environment,
+            vcs_name=getattr(args, 'vcs_name', None),
+            pc_name=getattr(args, 'pc_name', None),
+            agent_pool_name=getattr(args, 'agent_pool_name', None),
+            workspaces=getattr(args, 'workspaces', None) or "*",
+            skip_workspace_creation=getattr(args, 'skip_workspace_creation', False),
+            skip_backend_secrets=getattr(args, 'skip_backend_secrets', False),
+            lock=not getattr(args, 'skip_scalr_lock', False),
+            management_env_name=getattr(args, 'management_env_name', DEFAULT_MANAGEMENT_ENV_NAME),
             management_workspace_name=f"{args.scalr_environment}",
-            disable_deletion_protection=args.disable_deletion_protection,
-            skip_variables=args.skip_variables
+            disable_deletion_protection=getattr(args, 'disable_deletion_protection', False),
+            skip_variables=getattr(args, 'skip_variables', None)
         )
 
 class HClAttribute:
@@ -426,8 +429,9 @@ class APIClient:
     def make_request(self, url: str, method: str = "GET", data: Dict = None, headers: dict = None) -> Dict:
         if data:
             data = json.dumps(data).encode('utf-8')
-        
-        req = urllib.request.Request(url, data=data, method=method, headers=headers if headers else self.headers)
+
+        merged_headers = {**self.headers, **headers} if headers else self.headers
+        req = urllib.request.Request(url, data=data, method=method, headers=merged_headers)
         
         with urllib.request.urlopen(req) as response:
             if response.code != 204:
@@ -438,67 +442,79 @@ class APIClient:
         url = f"https://{self.hostname}{self.api_version}{route}{self._encode_filters(filters)}"
         return self.make_request(url)
 
-    def post(self, route: str, data: Dict) -> Dict:
+    def post(self, route: str, data: Dict, headers: Dict = None) -> Dict:
         url = f"https://{self.hostname}{self.api_version}{route}"
-        return self.make_request(url, method="POST", data=data)
+        return self.make_request(url, method="POST", data=data, headers=headers)
 
     def patch(self, route: str, data: Dict) -> Dict:
         url = f"https://{self.hostname}{self.api_version}{route}"
         return self.make_request(url, method="PATCH", data=data)
 
-class TFCClient(APIClient):
+class OnPremScalrClient(APIClient):
     def __init__(self, hostname: str, token: str):
-        self.cached_version = None
+        super().__init__(hostname, token, "/api/iacp/v3/")
 
-        if not self.cached_version:
-            url = f"https://{hostname}/.well-known/terraform.json"
-            well_known = self.make_request(url, method="GET", headers={'Accept': "application/json"})
-            self.cached_version = well_known.get("tfe.v2", "/api/v2/")
-
-        super().__init__(hostname, token, self.cached_version)
-
-    def get_organization(self, org_name: str) -> Dict:
-        return self.get(f"organizations/{org_name}")
-
-    def get_workspaces(self, org_name: str, page: int = 1, project_id: Optional[str] = None) -> Dict:
-        filters = {
-            "page[size]": 100,
-            "page[number]": page,
-        }
-        if project_id:
-            filters["filter[project][id]"] = project_id
-        return self.get(f"organizations/{org_name}/workspaces", filters)
-
-    def get_project(self, org_name: str, project_name: str) -> Optional[Dict]:
+    def get_environments(self, name: str = None) -> Optional[Dict]:
+        """Get environment by name from on-prem Scalr."""
         try:
-            response = self.get(f"organizations/{org_name}/projects", {"filter[names]": project_name})
-            projects = response.get("data", [])
-            return projects[0] if projects else None
+            response = self.get("environments", filters={"filter[name]": name} if name else None)
+            environments = response.get("data", [])
+
+            return environments
         except urllib.error.HTTPError as e:
             if e.code != 404:
                 raise
             return None
 
-    def get_workspace_vars(self, org_name: str, workspace_name: str) -> Dict:
+    def get_workspaces(self, environment_id: str, page: int = 1) -> Dict:
+        """Get workspaces from on-prem Scalr environment."""
         filters = {
-            "filter[workspace][name]": workspace_name,
-            "filter[organization][name]": org_name,
+            "page[size]": 100,
+            "page[number]": page,
+            "filter[environment]": environment_id,
         }
+        return self.get("workspaces", filters)
+
+    def get_workspace_vars(self, workspace_id: str) -> Dict:
+        """Get workspace variables from on-prem Scalr."""
+        filters = {"filter[workspace]": workspace_id}
         return self.get("vars", filters)
 
     def get_workspace_runs(self, workspace_id: str, page_size: int = 1) -> Dict:
-        filters = {"page[size]": page_size}
-        return self.get(f"workspaces/{workspace_id}/runs", filters)
+        """Get workspace runs from on-prem Scalr."""
+        filters = {"page[size]": page_size, 'filter[workspace]': workspace_id}
+        return self.get("runs", filters)
 
-    def get_run_plan(self, run_id: str) -> Dict:
+    def get_run_plan(self, plan_id: str) -> Dict:
+        """Get run plan from on-prem Scalr."""
         try:
-            return self.get(f"runs/{run_id}/plan/json-output")
+            return self.get(f"plans/{plan_id}/json-output")
         except Exception:
             ConsoleOutput.info("Skipping: plan file is unavailable")
             return {}
 
     def lock_workspace(self, workspace_id: str, reason: str) -> Dict:
-        return self.post(f"workspaces/{workspace_id}/actions/lock", {"reason": reason})
+        """Lock workspace in on-prem Scalr."""
+        return self.post(f"workspaces/{workspace_id}/actions/lock", {"reason": reason}, {"Content-Type": "application/json"})
+
+    def get_current_state_version(self, workspace_id: str) -> Optional[Dict]:
+        """Get current state version from on-prem Scalr workspace."""
+        try:
+            return self.get(f"workspaces/{workspace_id}/current-state-version")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            return None
+
+    def get_state_version_download_url(self, state_version_id: str) -> Optional[str]:
+        """Get state version download URL from on-prem Scalr."""
+        try:
+            response = self.get(f"state-versions/{state_version_id}")
+            return response.get("data", {}).get("attributes", {}).get("hosted-state-download-url")
+        except Exception:
+            return None
+
+
 
 class ScalrClient(APIClient):
     def __init__(self, hostname: str, token: str):
@@ -643,6 +659,9 @@ class ScalrClient(APIClient):
         return response
 
 def _enforce_max_version(tf_version: str, workspace_name) -> str:
+    if tf_version == "auto":
+        return tf_version
+
     if  tf_version == "latest" or version.parse(tf_version) > version.parse(MAX_TERRAFORM_VERSION):
         ConsoleOutput.warning(f"Warning: {workspace_name} uses Terraform {tf_version}. "
               f"Downgrading to {MAX_TERRAFORM_VERSION}")
@@ -650,7 +669,8 @@ def _enforce_max_version(tf_version: str, workspace_name) -> str:
     return tf_version
 
 class ConsoleOutput:
-    HEADER = '\033[95m'
+    TITLE = '\033[95m'
+    HEADER = '\033[96m'
     BLUE = '\033[94m'
     CYAN = '\033[96m'
     GREEN = '\033[92m'
@@ -681,9 +701,14 @@ class ConsoleOutput:
         print(f"{cls.BLUE}[DEBUG]{cls.ENDC} {message}")
 
     @classmethod
+    def title(cls, message: str) -> None:
+        print(f"\n{cls.TITLE}{cls.BOLD}{message}{cls.ENDC}")
+        print(f"{cls.TITLE}{'=' * len(message)}{cls.ENDC}\n")
+
+    @classmethod
     def section(cls, message: str) -> None:
         print(f"\n{cls.HEADER}{cls.BOLD}{message}{cls.ENDC}")
-        print(f"{cls.HEADER}{'=' * len(message)}{cls.ENDC}\n")
+        print(f"{cls.HEADER}{'-' * len(message)}{cls.ENDC}\n")
 
 def validate_trigger_pattern(pattern: str) -> bool:
     """
@@ -738,8 +763,8 @@ class MigrationService:
     def __init__(self, args: MigratorArgs):
         self.args: MigratorArgs = args
         self.resource_manager: ResourceManager = ResourceManager(f"generated-terraform/{self.args.scalr_environment}")
-        self.tfc: TFCClient = TFCClient(args.tfc_hostname, args.tfc_token)
-        self.scalr: ScalrClient = ScalrClient(args.scalr_hostname, args.scalr_token)
+        self.source_scalr: OnPremScalrClient = OnPremScalrClient(args.source_scalr_hostname, args.source_scalr_token)
+        self.dest_scalr: ScalrClient = ScalrClient(args.scalr_hostname, args.scalr_token)
         self.environment_resource_id: Optional[AbstractTerraformResource] = None
         self.project_id: Optional[str] = None
         self.vcs_id: Optional[str] = None
@@ -752,26 +777,26 @@ class MigrationService:
 
         self.load_account_id()
 
-    def create_workspace_map(self, tfc_workspace_id, workspace: AbstractTerraformResource) -> None:
-        self.workspaces_map[tfc_workspace_id] = workspace
+    def create_workspace_map(self, source_workspace_id, workspace: AbstractTerraformResource) -> None:
+        self.workspaces_map[source_workspace_id] = workspace
 
-    def get_mapped_scalr_workspace_id(self, tfc_workspace_id) -> AbstractTerraformResource:
-        if not self.workspaces_map.get(tfc_workspace_id):
-            raise MissingMappingError(f"The Scalr workspace for the source TFC workspace {tfc_workspace_id} does not exist or was not created within the current runtime.")
-        return self.workspaces_map[tfc_workspace_id]
+    def get_mapped_scalr_workspace_id(self, source_workspace_id) -> AbstractTerraformResource:
+        if not self.workspaces_map.get(source_workspace_id):
+            raise MissingMappingError(f"The destination Scalr workspace for the source workspace {source_workspace_id} does not exist or was not created within the current runtime.")
+        return self.workspaces_map[source_workspace_id]
 
     def load_account_id(self):
-        accounts = self.scalr.get("accounts")["data"]
+        accounts = self.dest_scalr.get("accounts")["data"]
         if not accounts:
-            ConsoleOutput.error("No account is associated with the given Scalr token.")
+            ConsoleOutput.error("No account is associated with the given destination Scalr token.")
             sys.exit(1)
         elif len(accounts) > 1:
-            ConsoleOutput.error("The token is associated with more than 1 account.")
+            ConsoleOutput.error("The destination Scalr token is associated with more than 1 account.")
             sys.exit(1)
         self.args.account_id = accounts[0]["id"]
 
     def get_vcs_data(self) -> Optional[TerraformDataSource]:
-        if self.args.vcs_name and not self.vcs_data:
+        if self.args.vcs_name and not self.resource_manager.has_data_source('scalr_vcs_provider', self.args.vcs_name):
             self.vcs_data = TerraformDataSource(
                 "scalr_vcs_provider",
                 self.args.vcs_name,
@@ -794,30 +819,17 @@ class MigrationService:
 
         return self.pc_data
 
-    def get_project_id(self) -> Optional[str]:
-        if not self.args.tfc_project:
-            return None
 
-        if not self.project_id:
-            project = self.tfc.get_project(self.args.tfc_organization, self.args.tfc_project)
-            if not project:
-                ConsoleOutput.warning(f"Project '{self.args.tfc_project}' not found in organization '{self.args.tfc_organization}'")
-                return None
-            self.project_id = project["id"]
-            ConsoleOutput.info(f"Found project '{self.args.tfc_project}' with ID: '{self.project_id}'")
-
-        return self.project_id
-
-    def get_environment_resource_id(self) -> Optional[AbstractTerraformResource]:
+    def get_environment_resource_id(self, env_name) -> Optional[AbstractTerraformResource]:
         if not self.environment_resource_id:
-            env_resource = self.resource_manager.get_resource("scalr_environment", self.args.scalr_environment)
+            env_resource = self.resource_manager.get_resource("scalr_environment", env_name)
             self.environment_resource_id = env_resource
         return self.environment_resource_id
 
     def create_environment(self, name: str, skip_terraform: bool = False) -> Dict:
-        """Get existing workspace or create a new one."""
+        """Get existing environment or create a new one."""
         # First try to find existing environment
-        environment = self.scalr.get_environment(name)
+        environment = self.dest_scalr.get_environment(name)
 
         if environment:
             if not skip_terraform:
@@ -827,27 +839,16 @@ class MigrationService:
                     self.resource_manager.add_data_source(environment_data_source)
             return environment
 
-        response = self.scalr.create_environment(name, self.args.account_id)["data"]
+        response = self.dest_scalr.create_environment(name, self.args.account_id)["data"]
 
         if not skip_terraform:
             # Create Terraform resource
-            env_resource = TerraformResource("scalr_environment", self.args.scalr_environment,{"name": name})
+            env_resource = TerraformResource("scalr_environment", name,{"name": name})
             env_resource.id = response["id"]
             self.resource_manager.add_resource(env_resource)
-        ConsoleOutput.success(f"Created main environment: {name}")
+        ConsoleOutput.success(f"Created destination environment: {name}")
 
         return response
-
-    def get_management_workspace_attributes(self):
-        return {
-            "attributes": {
-            "name": self.args.management_workspace_name,
-            "vcs-provider-id": self.args.vcs_name,
-            "terraform-version": MAX_TERRAFORM_VERSION,
-            "auto-apply": False,
-            "operations": True,
-            "deletion-protection-enabled": not self.args.disable_deletion_protection,
-        }}
 
     def get_agent_pool_data(self) -> Optional[TerraformDataSource]:
         """Get agent pool data source if agent pool name is provided."""
@@ -861,43 +862,62 @@ class MigrationService:
         return self.agent_pool_data
 
     def get_agent_pool_id(self) -> str:
-        """Get agent pool ID from the data source."""
+        """Get agent pool ID from the destination Scalr."""
         if self.args.agent_pool_name and not self.agent_pool_id:
-            agent_pools = self.scalr.get('agent-pools', {"filter[name]": self.args.agent_pool_name})['data']
+            agent_pools = self.dest_scalr.get('agent-pools', {"filter[name]": self.args.agent_pool_name})['data']
             if not len(agent_pools):
                 raise MissingDataError(f"Agent pool with name '{self.args.agent_pool_name}' not found.")
             agent_pool_id = agent_pools[0]["id"]
             self.agent_pool_id = agent_pool_id
-            agents = self.scalr.get('agents', {"filter[agent-pool]": agent_pool_id})['data']
+            agents = self.dest_scalr.get('agents', {"filter[agent-pool]": agent_pool_id})['data']
 
             if not len(agents):
                 raise MissingDataError(f"Agent pool with name '{self.args.agent_pool_name}' does not have active agents.")
 
         return self.agent_pool_id
 
+    def create_management_workspace(self, env: dict) -> None:
+        env_id = env["id"]
+        environment_name = env["attributes"]["name"]
+        workspace = self.dest_scalr.get_workspace(env_id, environment_name)
+
+        if workspace:
+            return
+
+        attributes = {
+            "name": environment_name,
+            "terraform-version": MAX_TERRAFORM_VERSION,
+            "auto-apply": False,
+            "operations": True,
+        }
+
+        self.dest_scalr.create_workspace(env_id, attributes)
+
+
     def create_workspace(
         self,
-        env_id: str,
-        tf_workspace: Dict,
+        env: dict,
+        source_workspace: Dict,
         is_management_workspace: Optional[bool] = False
     ) -> AbstractTerraformResource:
-        attributes = tf_workspace["attributes"]
         """Get existing workspace or create a new one."""
+        env_id = env["id"]
+        attributes = source_workspace["attributes"]
         # First try to find existing workspace
-        workspace = self.scalr.get_workspace(env_id, attributes['name'])
+        workspace = self.dest_scalr.get_workspace(env_id, attributes['name'])
 
-        if (workspace is not None) ^ self.args.skip_workspace_creation:
+        if workspace and not is_management_workspace:
             workspace_data = TerraformDataSource("scalr_workspace", env_id, {"name": attributes['name']})
             workspace_data.id = workspace["id"]
-            if tf_workspace.get("id"):
-                self.create_workspace_map(tf_workspace['id'], workspace_data)
+            if source_workspace.get("id"):
+                self.create_workspace_map(source_workspace['id'], workspace_data)
             return workspace_data
 
         ConsoleOutput.info(f"Creating workspace '{attributes['name']}'...")
 
         terraform_version = _enforce_max_version(attributes.get("terraform-version", "1.6.0"), attributes["name"])
         execution_mode = "remote" if attributes.get("operations") else "local"
-        global_remote_state = attributes.get("global-remote-state", False)
+        global_remote_state = attributes.get("remote-state-sharing", False)
 
         workspace_attrs = {
             "name": attributes["name"],
@@ -905,7 +925,7 @@ class MigrationService:
             "operations": attributes["operations"],
             "terraform-version": terraform_version,
             "working-directory": attributes.get("working-directory"),
-            "deletion-protection-enabled": not self.args.disable_deletion_protection,
+            "deletion-protection-enabled": attributes.get("deletion-protection-enabled", False),
             "remote-state-sharing": global_remote_state,
         }
 
@@ -922,27 +942,24 @@ class MigrationService:
 
             workspace_attrs["vcs-repo"] = {
                 "identifier": vcs_repo["identifier"],
-                "dry-runs-enabled": attributes.get("speculative-enabled", True),
-                "trigger-prefixes": attributes.get("trigger-prefixes", vcs_repo.get("trigger-prefixes", [])),
+                "dry-runs-enabled": vcs_repo.get("dry-runs-enabled", True),
+                "trigger-prefixes": vcs_repo.get("trigger-prefixes", []),
+                "trigger-patterns": vcs_repo.get("trigger-patterns"),
                 "branch": branch,
                 "ingress-submodules": vcs_repo["ingress-submodules"],
             }
 
-            if attributes.get("trigger-patterns"):
-                trigger_patterns = handle_trigger_patterns(attributes["trigger-patterns"])
-                workspace_attrs["vcs-repo"]["trigger-patterns"] = trigger_patterns
-            elif vcs_repo.get("trigger-patterns"):
-                trigger_patterns = vcs_repo.get("trigger-patterns", [])
-                workspace_attrs["vcs-repo"]["trigger-patterns"] = trigger_patterns
-
-        relationships = tf_workspace.get('relationships', {})
+        relationships = source_workspace.get('relationships', {})
         agent_pool_id = self.get_agent_pool_id() if relationships.get("agent-pool") else None
-        response = self.scalr.create_workspace(env_id, workspace_attrs, vcs_id, agent_pool_id)
+        response = self.dest_scalr.create_workspace(env_id, workspace_attrs, vcs_id, agent_pool_id)
 
         ConsoleOutput.success(f"Created workspace '{attributes['name']}'")
 
+        if is_management_workspace:
+            return response['data']
+
         if pc_id:
-            self.scalr.link_provider_config(response["data"]["id"], pc_id)
+            self.dest_scalr.link_provider_config(response["data"]["id"], pc_id)
             ConsoleOutput.info(f"Linked provider configuration: {self.args.pc_name}")
 
         # Create Terraform resource
@@ -952,7 +969,7 @@ class MigrationService:
             "execution_mode": execution_mode,
             "terraform_version": terraform_version,
             "working_directory": attributes.get("working-directory"),
-            "environment_id": self.get_environment_resource_id(),
+            "environment_id": self.get_environment_resource_id(env["attributes"]["name"]),
             "deletion_protection_enabled": not self.args.disable_deletion_protection
         }
 
@@ -962,13 +979,14 @@ class MigrationService:
         if vcs_repo:
             resource_attributes["vcs_repo"] = {
                 "identifier": vcs_repo["identifier"],
-                "dry_runs_enabled": attributes["speculative-enabled"],
+                "dry_runs_enabled": vcs_repo["dry-runs-enabled"],
                 "branch": branch,
                 "ingress_submodules": vcs_repo["ingress-submodules"],
             }
             resource_attributes["vcs_provider_id"] = self.get_vcs_data()
-            if attributes.get("trigger-prefixes"):
-                resource_attributes["vcs_repo"]["trigger_prefixes"] = attributes["trigger-prefixes"]
+
+            if vcs_repo.get("trigger-prefixes"):
+                resource_attributes["vcs_repo"]["trigger_prefixes"] = vcs_repo["trigger-prefixes"]
 
             if trigger_patterns:
                 resource_attributes["vcs_repo"]["trigger_patterns"] = trigger_patterns
@@ -986,8 +1004,8 @@ class MigrationService:
         )
 
         workspace_resource.id = response["data"]["id"]
-        if tf_workspace.get('id'):
-            self.create_workspace_map(tf_workspace['id'], workspace_resource)
+        if source_workspace.get('id'):
+            self.create_workspace_map(source_workspace['id'], workspace_resource)
 
         if not is_management_workspace:
             self.resource_manager.add_resource(workspace_resource)
@@ -996,28 +1014,33 @@ class MigrationService:
 
     def get_current_state(self, workspace_id: str) -> Optional[Dict]:
         try:
-            return self.scalr.get(f"workspaces/{workspace_id}/current-state-version")
+            return self.dest_scalr.get(f"workspaces/{workspace_id}/current-state-version")
         except urllib.error.HTTPError as e:
             if e.code != 404:
                 raise
 
-    def create_state(self, tf_workspace: Dict, workspace_id: str) -> None:
-        current_scalr_state = self.get_current_state(workspace_id)
-        current_tf_state = tf_workspace["relationships"]["current-state-version"]
-
-        if not current_tf_state or not current_tf_state.get("links"):
-            ConsoleOutput.warning("State file is missing")
+    def create_state(self, source_workspace: Dict, workspace_id: str) -> None:
+        current_dest_state = self.get_current_state(workspace_id)
+        
+        # Get current state from source on-prem Scalr
+        source_state_version = self.source_scalr.get_current_state_version(source_workspace["id"])
+        
+        if not source_state_version:
+            ConsoleOutput.warning("Source state file is missing")
             return
 
-        current_state_url = current_tf_state["links"]["related"]
-        state = self.tfc.get_by_short_url(current_state_url)["data"]["attributes"]
-
-        if not state["hosted-state-download-url"]:
-            ConsoleOutput.warning("State file URL is unavailable")
+        # Get state download URL from source
+        state_download_url = source_state_version["data"]["links"]["download"]
+        
+        if not state_download_url:
+            ConsoleOutput.warning("Source state file URL is unavailable")
             return
 
-        raw_state = self.tfc.make_request(state["hosted-state-download-url"])
-        serial = current_scalr_state["data"]["attributes"]["serial"] if current_scalr_state else None
+        # Download state from source
+        raw_state = self.source_scalr.make_request(state_download_url)
+        
+        # Check if state is already up-to-date
+        serial = current_dest_state["data"]["attributes"]["serial"] if current_dest_state else None
         if serial == raw_state["serial"]:
             ConsoleOutput.info(f"State with serial '{serial}' is up-to-date")
             return
@@ -1034,7 +1057,7 @@ class MigrationService:
             "state": encoded_state.decode("utf-8")
         }
 
-        self.scalr.create_state_version(workspace_id, state_attrs)
+        self.dest_scalr.create_state_version(workspace_id, state_attrs)
 
     def create_backend_config(self) -> None:
         """Create backend configuration for the management workspace."""
@@ -1056,14 +1079,14 @@ class MigrationService:
             f.write(f"# Generated at: {datetime.now().isoformat()}\n\n")
             f.write(backend_config)
 
-    def migrate_workspace(self, tf_workspace: Dict, env: Dict) -> bool:
-        workspace_name = tf_workspace["attributes"]["name"]
+    def migrate_workspace(self, source_workspace: Dict, env: Dict) -> bool:
+        workspace_name = source_workspace["attributes"]["name"]
         ConsoleOutput.section(f"Migrating workspace '{workspace_name}' into '{env['attributes']['name']}'...")
 
-        workspace = self.create_workspace(env['id'], tf_workspace)
+        workspace = self.create_workspace(env, source_workspace)
 
         ConsoleOutput.info(f"Migrating state...")
-        self.create_state(tf_workspace, workspace.id)
+        self.create_state(source_workspace, workspace.id)
 
         # Skip variable migration if requested
         if self.args.skip_variables == "*":
@@ -1083,7 +1106,7 @@ class MigrationService:
         skipped_sensitive_vars = {}
         skip_patterns = self.args.skip_variables.split(',') if self.args.skip_variables else []
 
-        for api_var in self.tfc.get_workspace_vars(self.args.tfc_organization, workspace_name)["data"]:
+        for api_var in self.source_scalr.get_workspace_vars(source_workspace["id"])["data"]:
             attributes = api_var["attributes"]
             var_key: str = attributes["key"]
 
@@ -1104,7 +1127,7 @@ class MigrationService:
                 continue
 
             try:
-                response = self.scalr.create_variable(
+                response = self.dest_scalr.create_variable(
                     attributes["key"],
                     attributes["value"],
                     attributes["category"],
@@ -1137,10 +1160,10 @@ class MigrationService:
             self.resource_manager.add_resource(var_resource)
 
         # Get sensitive variables from plan
-        run = self.tfc.get_workspace_runs(tf_workspace["id"])["data"]
+        run = self.source_scalr.get_workspace_runs(source_workspace["id"])["data"]
         if run:
             ConsoleOutput.info("Trying to migrate sensitive variables...")
-            plan = self.tfc.get_run_plan(run[0]["id"])
+            plan = self.source_scalr.get_run_plan(run[0]["relationships"]["plan"]["data"]["id"])
             if "variables" in plan:
                 ConsoleOutput.info("Plan file is available, reading its variables...")
                 variables = plan["variables"]
@@ -1150,7 +1173,7 @@ class MigrationService:
                 for var in configuration_variables:
                     if "sensitive" in configuration_variables[var]:
                         ConsoleOutput.info(f"Creating sensitive variable '{var}' from the plan file")
-                        response = self.scalr.create_variable(
+                        response = self.dest_scalr.create_variable(
                             var,
                             variables[var]["value"],
                             "terraform",
@@ -1178,16 +1201,16 @@ class MigrationService:
                         self.resource_manager.add_resource(var_resource)
 
         if self.args.lock:
-            if tf_workspace["attributes"]["locked"]:
-                ConsoleOutput.info("Workspace is already locked")
+            if source_workspace["attributes"]["locked"]:
+                ConsoleOutput.info("Source workspace is already locked")
                 return True
 
-            env_name = self.args.scalr_environment
-            self.tfc.lock_workspace(
-                tf_workspace["id"],
-                f"Workspace is migrated to the Scalr environment '{env_name}' with name '{workspace_name}'."
+            env_name = env["attributes"]["name"]
+            self.source_scalr.lock_workspace(
+                source_workspace["id"],
+                f"Workspace is migrated to the SaaS Scalr environment '{env_name}' with name '{workspace_name}'."
             )
-            ConsoleOutput.success(f"Workspace '{workspace_name}' is locked")
+            ConsoleOutput.success(f"Source workspace '{workspace_name}' is locked")
 
         return True
 
@@ -1214,8 +1237,8 @@ class MigrationService:
         vars_to_create = {
             "SCALR_HOSTNAME": self.args.scalr_hostname,
             "SCALR_TOKEN": self.args.scalr_token,
-            "TFE_HOSTNAME": self.args.tfc_hostname,
-            "TFE_TOKEN": self.args.tfc_token,
+            "SOURCE_SCALR_HOSTNAME": self.args.source_scalr_hostname,
+            "SOURCE_SCALR_TOKEN": self.args.source_scalr_token,
         }
 
         for key in vars_to_create:
@@ -1224,10 +1247,10 @@ class MigrationService:
                 "filter[key]": key,
                 "filter[environment]": None
             }
-            if self.scalr.get("vars", vars_filters)["data"]:
+            if self.dest_scalr.get("vars", vars_filters)["data"]:
                 continue
             try:
-                self.scalr.create_variable(
+                self.dest_scalr.create_variable(
                     key,
                     vars_to_create[key],
                     "shell",
@@ -1272,7 +1295,7 @@ class MigrationService:
 
     def get_vcs_provider_id(self) -> str:
         if self.args.vcs_name and not self.vcs_id:
-            vcs_provider = self.scalr.get("vcs-providers", {"query": self.args.vcs_name})["data"][0]
+            vcs_provider = self.dest_scalr.get("vcs-providers", {"query": self.args.vcs_name})["data"][0]
             if not vcs_provider:
                 raise MissingDataError(f"VCS provider with name '{self.args.vcs_name}' not found.")
             self.vcs_id = vcs_provider["id"]
@@ -1281,7 +1304,7 @@ class MigrationService:
 
     def get_provider_configuration(self) -> Dict:
         if self.args.pc_name and not self.provider_config:
-            pc_provider = self.scalr.get("provider-configurations", {"filter[name]": self.args.pc_name})["data"][0]
+            pc_provider = self.dest_scalr.get("provider-configurations", {"filter[name]": self.args.pc_name})["data"][0]
             if not pc_provider:
                 raise MissingDataError(f"Provider configuration with name '{self.args.pc_name}' not found.")
             self.provider_config = pc_provider
@@ -1320,43 +1343,15 @@ class MigrationService:
             }
         }
 
-        self.scalr.patch(f"provider-configurations/{provider_configuration['id']}", attributes)
+        self.dest_scalr.patch(f"provider-configurations/{provider_configuration['id']}", attributes)
 
-    def migrate(self):
-        ConsoleOutput.section("Preparing migration")
-        self.init_backend_secrets()
-
-        # Get organization and create environment
-        tf_organization = self.args.tfc_organization
-        self.tfc.get_organization(tf_organization)
-
-        project_msg = ''
-        if self.args.tfc_project:
-            project_msg = f" (project '{self.args.tfc_project}')"
-
-        # Get project ID if specified
-        project_id = self.get_project_id()
-        if project_id:
-            ConsoleOutput.info(f"Filtering TFC workspaces by project: '{self.args.tfc_project}'")
-
-        ConsoleOutput.info(
-            f"Migrating organization '{tf_organization}'{project_msg} into environment '{self.args.scalr_environment}'"
-        )
-
-        # Create management environment and workspace
-        ConsoleOutput.info(f"Creating post-management Scalr environment '{self.args.management_env_name}'...")
-        management_env = self.create_environment(self.args.management_env_name, skip_terraform=True)
-
-        ConsoleOutput.info(f"Creating post-management Scalr workspace '{self.args.management_workspace_name}'...")
-        self.create_workspace(
-            management_env["id"],
-            self.get_management_workspace_attributes(),
-            is_management_workspace=True
-        )
+    def migrate(self, source_environment: dict) -> dict:
+        environment_name = source_environment['attributes']['name']
+        ConsoleOutput.title(f"Migrating from on-prem Scalr environment '{environment_name}' to SaaS")
 
         # Create or get the main environment
-        ConsoleOutput.info(f"Creating destination Scalr environment '{self.args.scalr_environment}'...")
-        env = self.create_environment(self.args.scalr_environment)
+        ConsoleOutput.info(f"Creating destination Scalr environment '{environment_name}'...")
+        env = self.create_environment(environment_name)
         self.update_provider_configuration(env['id'])
 
         # Create backend configuration for the management workspace
@@ -1371,14 +1366,14 @@ class MigrationService:
         workspace_state_consumers = {}
 
         while True:
-            tfc_workspaces = self.tfc.get_workspaces(tf_organization, next_page, project_id=project_id)
-            next_page = tfc_workspaces["meta"]["pagination"]["next-page"]
+            source_workspaces = self.source_scalr.get_workspaces(source_environment["id"], next_page)
+            next_page = source_workspaces["meta"]["pagination"]["next-page"]
 
-            for tf_workspace in tfc_workspaces["data"]:
-                workspace_name = tf_workspace["attributes"]["name"]
-                state_consumers = tf_workspace["relationships"].get('remote-state-consumers')
-                if not tf_workspace["attributes"].get("global-remote-state", False) and state_consumers:
-                    workspace_state_consumers.update({tf_workspace['id']: {
+            for source_workspace in source_workspaces["data"]:
+                workspace_name = source_workspace["attributes"]["name"]
+                state_consumers = source_workspace["relationships"].get('remote-state-consumers')
+                if not source_workspace["attributes"].get("global-remote-state", False) and state_consumers:
+                    workspace_state_consumers.update({source_workspace['id']: {
                         "url": state_consumers['links']['related'],
                         "workspace_name": workspace_name,
                     }})
@@ -1387,7 +1382,7 @@ class MigrationService:
                     continue
 
                 try:
-                    result = self.migrate_workspace(tf_workspace,env)
+                    result = self.migrate_workspace(source_workspace, env)
 
                     if not result:
                         skipped_workspaces.append(workspace_name)
@@ -1407,25 +1402,25 @@ class MigrationService:
 
         if len(workspace_state_consumers):
             ConsoleOutput.section("Post-migrating state consumers")
-        for tfc_id, consumers_data in workspace_state_consumers.items():
+        for source_id, consumers_data in workspace_state_consumers.items():
             try:
-                scalr_id = self.get_mapped_scalr_workspace_id(tfc_id).id
+                dest_workspace_id = self.get_mapped_scalr_workspace_id(source_id).id
                 consumer_ids = []
                 consumer_resources: List[AbstractTerraformResource] = []
-                tfc_consumers = self.tfc.get_by_short_url(consumers_data['url'])['data']
-                for state_consumer in tfc_consumers:
+                source_consumers = self.source_scalr.get_by_short_url(consumers_data['url'])['data']
+                for state_consumer in source_consumers:
                     consumer = self.get_mapped_scalr_workspace_id(state_consumer['id'])
                     consumer_ids.append(consumer.id)
                     consumer_resources.append(consumer)
 
                 if consumer_ids:
-                    self.scalr.update_consumers(scalr_id, consumer_ids)
+                    self.dest_scalr.update_consumers(dest_workspace_id, consumer_ids)
 
                     self.resource_manager.get_resource(
                         'scalr_workspace',
                         consumers_data['workspace_name']
                     ).add_attribute('remote_state_consumers', consumer_resources)
-                    ConsoleOutput.info(f"Updated state consumers for workspace '{scalr_id}'...")
+                    ConsoleOutput.info(f"Updated state consumers for workspace '{consumers_data['workspace_name']}'...")
             except MissingMappingError as e:
                 ConsoleOutput.warning(f"Unable to post-migrate state consumers. {e}")
                 continue
@@ -1436,19 +1431,16 @@ class MigrationService:
                 ConsoleOutput.error(f"Unable to update remote state consumers: {e}")
                 continue
 
-        ConsoleOutput.section("Migration Summary")
-        ConsoleOutput.success(f"Successfully migrated {len(successful_workspaces)} workspace(s)")
-        if skipped_workspaces:
-            ConsoleOutput.warning(f"Skipped {len(skipped_workspaces)} workspace(s): {', '.join(skipped_workspaces)}")
-
         # Write generated Terraform resources
         output_dir = self.resource_manager.output_dir
         self.resource_manager.write_resources(output_dir)
-        ConsoleOutput.success(f"Generated Terraform configuration in directory: {output_dir}")
-        
-        # Check and update Terraform credentials
-        self.check_and_update_credentials()
-        ConsoleOutput.info("Credentials have been automatically configured in ~/.terraform.d/credentials.tfrc.json")
+
+        ConsoleOutput.success(f"Successfully migrated {len(successful_workspaces)} workspaces.")
+
+        return {
+            "successful-workspaces": len(successful_workspaces),
+            "skipped-workspaces": len(skipped_workspaces),
+        }
 
 def validate_vcs_name(args: argparse.Namespace) -> None:
     if not args.skip_workspace_creation and not args.vcs_name:
@@ -1456,41 +1448,76 @@ def validate_vcs_name(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 def main():
-    parser = argparse.ArgumentParser(description='Migrate workspaces from TFC/E to Scalr')
-    parser.add_argument('--scalr-hostname', type=str, help='Scalr hostname')
-    parser.add_argument('--scalr-token', type=str, help='Scalr token')
-    parser.add_argument('--scalr-environment', type=str, help='Optional. Scalr environment to create. By default it takes TFC/E organization name.')
-    parser.add_argument('--tfc-hostname', type=str, help='TFC/E hostname')
-    parser.add_argument('--tfc-token', type=str, help='TFC/E token')
-    parser.add_argument('--tfc-organization', type=str, help='TFC/E organization name')
-    parser.add_argument('-v', '--vcs-name', type=str, help='VCS identifier')
-    parser.add_argument('--pc-name', type=str, help='Provider configuration name')
-    parser.add_argument('--agent-pool-name', type=str, help='Scalr agent pool name')
-    parser.add_argument('-w', '--workspaces', type=str, help='Workspaces to migrate. By default - all')
-    parser.add_argument('--skip-workspace-creation', action='store_true', help='Whether to create new workspaces in Scalr. Set to True if the workspace is already created in Scalr.')
-    parser.add_argument('--skip-backend-secrets', action='store_true', help='Whether to create shell variables (`SCALR_` and `TFC_`) in Scalr.')
-    parser.add_argument('--skip-tfc-lock', action='store_true', help='Whether to skip locking of TFC/E workspaces')
+    parser = argparse.ArgumentParser(description='Migrate workspaces from on-prem Scalr to SaaS Scalr')
+    
+    # Destination SaaS Scalr arguments
+    parser.add_argument('--scalr-hostname', type=str, required=True, help='Destination SaaS Scalr hostname')
+    parser.add_argument('--scalr-token', type=str, required=True, help='Destination SaaS Scalr token')
+    parser.add_argument('--scalr-environment', type=str, help='Destination Scalr environment name. Defaults to source environment name.')
+    
+    # Source on-prem Scalr arguments
+    parser.add_argument('--source-scalr-hostname', type=str, required=True, help='Source on-prem Scalr hostname')
+    parser.add_argument('--source-scalr-token', type=str, required=True, help='Source on-prem Scalr token')
+    parser.add_argument('--source-scalr-environment', type=str, help='Source on-prem Scalr environment name')
+    
+    # Migration options
+    parser.add_argument('-v', '--vcs-name', type=str, help='VCS provider name in destination Scalr')
+    parser.add_argument('--pc-name', type=str, help='Provider configuration name in destination Scalr')
+    parser.add_argument('--agent-pool-name', type=str, help='Agent pool name in destination Scalr')
+    parser.add_argument('-w', '--workspaces', type=str, help='Workspace name pattern (supports glob patterns, default: "*")')
+    parser.add_argument('--skip-workspace-creation', action='store_true', help='Skip creating new workspaces in destination Scalr')
+    parser.add_argument('--skip-backend-secrets', action='store_true', help='Skip creating shell variables in destination Scalr')
+    parser.add_argument('--skip-scalr-lock', action='store_true', help='Skip locking source on-prem Scalr workspaces after migration')
     parser.add_argument('--management-env-name', type=str, default=DEFAULT_MANAGEMENT_ENV_NAME, help=f'Name of the management environment. Default: {DEFAULT_MANAGEMENT_ENV_NAME}')
-    parser.add_argument('--disable-deletion-protection', action='store_true', help='Disable deletion protection in workspace resources. Default: enabled')
-    parser.add_argument('--tfc-project', type=str, help='TFC project name to filter workspaces by')
+    parser.add_argument('--disable-deletion-protection', action='store_true', help='Disable deletion protection in workspace resources')
     parser.add_argument('--skip-variables', type=str, help='Comma-separated list of variable keys to skip, or "*" to skip all variables')
 
     args = parser.parse_args()
     
-    # Validate required arguments
-    required_args = ['scalr_hostname', 'scalr_token', 'tfc_hostname', 'tfc_token', 'tfc_organization']
-    missing_args = [arg for arg in required_args if not getattr(args, arg)]
-    if missing_args:
-        ConsoleOutput.error(f"Missing required arguments: {', '.join(missing_args)}")
-        sys.exit(1)
-
     # Validate vcs_name if needed
     validate_vcs_name(args)
 
     # Convert argparse namespace to MigratorArgs and run migration
     migrator_args = MigratorArgs.from_argparse(args)
     migration_service = MigrationService(migrator_args)
-    migration_service.migrate()
+    # Get source environment
+    source_environments = migration_service.source_scalr.get_environments(migrator_args.source_scalr_environment)
+    if not source_environments:
+        ConsoleOutput.error(f"Source environment '{migrator_args.source_scalr_environment}' not found in on-prem Scalr")
+        sys.exit(1)
+
+    ConsoleOutput.title("Preparing migration")
+    migration_service.init_backend_secrets()
+    migrated_environments = 0
+    migrated_workspaces = 0
+    skipped_workspaces = 0
+
+    # Create management environment and workspace
+    ConsoleOutput.info(f"Creating post-management Scalr environment '{migrator_args.management_env_name}'...")
+    management_env = migration_service.create_environment(migrator_args.management_env_name, skip_terraform=True)
+
+    for source_env in source_environments:
+        environment_name = source_env['attributes']['name']
+        args.scalr_environment = environment_name
+        migrator = MigrationService(migrator_args)
+        result = migrator.migrate(source_env)
+
+        ConsoleOutput.info(f"Creating post-management Scalr workspace '{environment_name}'...")
+        migrator.create_management_workspace(management_env)
+
+        migrated_workspaces += result["successful-workspaces"]
+        skipped_workspaces += result["skipped-workspaces"]
+        migrated_environments += 1 if result["successful-workspaces"] else 0
+        ConsoleOutput.success(f"Successfully migrated environment '{environment_name}'.")
+
+    ConsoleOutput.title("Migration summary")
+    ConsoleOutput.info(f"Migrated environments: {migrated_environments}")
+    ConsoleOutput.info(f"Migrated workspaces: {migrated_workspaces}")
+    ConsoleOutput.info(f"Skipped workspaces: {skipped_workspaces}")
+
+    # Check and update Terraform credentials
+    migration_service.check_and_update_credentials()
+    ConsoleOutput.info("Credentials have been automatically configured in ~/.terraform.d/credentials.tfrc.json")
 
 if __name__ == "__main__":
     main()

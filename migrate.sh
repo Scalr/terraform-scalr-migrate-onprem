@@ -19,7 +19,7 @@ find_python() {
     local python_cmd=""
     
     # Try different Python commands in order of preference
-    for cmd in python3.12 python3 python; do
+    for cmd in python3.12 python3.11 python3.10 python3.9 python3.8 python3 python; do
         if command_exists "$cmd"; then
             # Check if it's Python 3.x
             local version
@@ -34,7 +34,7 @@ find_python() {
     done
     
     if [ -z "$python_cmd" ]; then
-        echo "Python 3.x is required but not found. Please install Python 3.x first."
+        echo "Python 3.8 or higher is required but not found. Please install Python 3.8+ first."
         exit 1
     fi
     
@@ -87,15 +87,11 @@ read_tfrc_credentials() {
             export SCALR_TOKEN="$scalr_token"
         fi
 
-        if [ -z "$TFC_HOSTNAME" ]; then
-          export TFC_HOSTNAME="app.terraform.io"
-        fi
-
-        # Read TFC token
-        local tfc_token
-        tfc_token=$(jq -r ".credentials.\"$TFC_HOSTNAME\".token" "$credentials_file" 2>/dev/null)
-        if [ "$tfc_token" != "null" ]; then
-            export TFC_TOKEN="$tfc_token"
+        # Read source Scalr token
+        local source_scalr_token
+        source_scalr_token=$(jq -r ".credentials.\"$SOURCE_SCALR_HOSTNAME\".token" "$credentials_file" 2>/dev/null)
+        if [ "$source_scalr_token" != "null" ]; then
+            export SOURCE_SCALR_TOKEN="$source_scalr_token"
         fi
     fi
 }
@@ -112,16 +108,12 @@ validate_required_params() {
         missing_params+=("SCALR_TOKEN")
     fi
     
-    if [ -z "$TFC_TOKEN" ]; then
-        missing_params+=("TFC_TOKEN")
+    if [ -z "$SOURCE_SCALR_HOSTNAME" ]; then
+        missing_params+=("SOURCE_SCALR_HOSTNAME")
     fi
     
-    if [ -z "$TFC_ORGANIZATION" ]; then
-        missing_params+=("TFC_ORGANIZATION")
-    fi
-    
-    if [ -z "$SCALR_ENVIRONMENT" ]; then
-        missing_params+=("SCALR_ENVIRONMENT")
+    if [ -z "$SOURCE_SCALR_TOKEN" ]; then
+        missing_params+=("SOURCE_SCALR_TOKEN")
     fi
     
     if [ -z "$SCALR_VCS_NAME" ] && [ "$SKIP_WORKSPACE_CREATION" != "true" ]; then
@@ -137,32 +129,31 @@ validate_required_params() {
 # Function to display help
 show_help() {
     echo "Usage: $0 [OPTIONS]"
-    echo "Migrate workspaces from TFC/E to Scalr"
+    echo "Migrate workspaces from on-prem Scalr to SaaS Scalr"
     echo ""
     echo "Required options:"
-    echo "  --scalr-hostname HOSTNAME   Scalr hostname"
-    echo "  --scalr-token TOKEN         Scalr token"
-    echo "  --tfc-hostname HOSTNAME     TFC/E hostname"
-    echo "  --tfc-token TOKEN           TFC/E token"
-    echo "  --tfc-organization ORG      TFC/E organization name"
+    echo "  --scalr-hostname HOSTNAME         Destination SaaS Scalr hostname"
+    echo "  --scalr-token TOKEN               Destination SaaS Scalr token"
+    echo "  --source-scalr-hostname HOSTNAME Source on-prem Scalr hostname"
+    echo "  --source-scalr-token TOKEN       Source on-prem Scalr token"
+    echo "  --source-scalr-environment ENV   Source on-prem Scalr environment name"
     echo ""
     echo "Optional options:"
-    echo "  --tfc-project PROJECT             TFC project name to filter workspaces by"
-    echo "  --scalr-environment ENV           Scalr environment to create (default: TFC/E organization name)"
-    echo "  --vcs-name NAME                   VCS identifier. Required for creation VCS-driven workspaces."
-    echo "  --pc-name NAME                    Provider configuration name to link to workspaces"
+    echo "  --scalr-environment ENV           Destination Scalr environment name (default: source environment name)"
+    echo "  --vcs-name NAME                   VCS provider name in destination Scalr"
+    echo "  --pc-name NAME                    Provider configuration name in destination Scalr"
+    echo "  --agent-pool-name NAME            Agent pool name in destination Scalr"
     echo "  --workspaces PATTERN              Workspaces to migrate (default: all)"
-    echo "  --skip-workspace-creation         Skip creating new workspaces in Scalr"
-    echo "  --skip-backend-secrets            Skip creating shell variables in Scalr"
-    echo "  --skip-tfc-lock                   Skip locking of the TFC/E workspaces after migration"
+    echo "  --skip-workspace-creation         Skip creating new workspaces in destination Scalr"
+    echo "  --skip-backend-secrets            Skip creating shell variables in destination Scalr"
+    echo "  --skip-scalr-lock                 Skip locking source on-prem Scalr workspaces after migration"
     echo "  --management-env-name NAME        Name of the management environment (default: scalr-admin)"
     echo "  --disable-deletion-protection     Disable deletion protection in workspace resources"
     echo "  --skip-variables PATTERNS         Comma-separated list of variable keys to skip, or '*' to skip all variables"
-    echo "  --agent-pool-name NAME            Scalr agent pool name"
     echo "  --help                            Show this help message"
     echo ""
     echo "Example:"
-    echo "  $0 --scalr-hostname app.scalr.io --scalr-token token --tfc-hostname app.terraform.io --tfc-token token --tfc-organization org --vcs-name vcs"
+    echo "  $0 --source-scalr-hostname onprem.scalr.local --source-scalr-token src-token --source-scalr-environment src-env --scalr-hostname account.scalr.io --scalr-token dest-token --vcs-name vcs"
 }
 
 # Parse command line arguments
@@ -187,7 +178,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         # Handle space-separated format
-        --scalr-hostname|--scalr-token|--scalr-environment|--tfc-hostname|--tfc-token|--tfc-organization|--tfc-project|--vcs-name|--pc-name|--workspaces|--management-env-name|--skip-variables|--agent-pool-name)
+        --scalr-hostname|--scalr-token|--scalr-environment|--source-scalr-hostname|--source-scalr-token|--source-scalr-environment|--vcs-name|--pc-name|--workspaces|--management-env-name|--skip-variables|--agent-pool-name)
             param="${1#--}"  # Remove leading --
             env_var=$(echo "$param" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
             case $1 in
@@ -209,7 +200,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         # Handle boolean flags
-        --skip-workspace-creation|--skip-backend-secrets|--skip-tfc-lock|--disable-deletion-protection)
+        --skip-workspace-creation|--skip-backend-secrets|--skip-scalr-lock|--disable-deletion-protection)
             param="${1#--}"  # Remove leading --
             env_var=$(echo "$param" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
             export "$env_var"=true
@@ -228,11 +219,7 @@ done
 
 # Set default values if not provided
 if [ -z "$SCALR_ENVIRONMENT" ]; then
-    if [ -n "$TFC_PROJECT" ]; then
-        export SCALR_ENVIRONMENT="$TFC_PROJECT"
-    else
-        export SCALR_ENVIRONMENT="$TFC_ORGANIZATION"
-    fi
+    export SCALR_ENVIRONMENT="$SOURCE_SCALR_ENVIRONMENT"
 fi
 
 # Read credentials from file if not provided
@@ -242,7 +229,7 @@ read_tfrc_credentials
 validate_required_params
 
 # Set default values if not provided
-MANAGEMENT_ENV_NAME=${MANAGEMENT_ENV_NAME:-$DEFAULT_MANAGEMENT_ENV_NAME}
+MANAGEMENT_ENV_NAME=${MANAGEMENT_ENV_NAME:-"scalr-admin"}
 
 install_dependencies=false
 # Create and activate virtual environment
@@ -266,18 +253,17 @@ CMD="\"$PYTHON_CMD\" migrator.py"
 CMD="$CMD --scalr-hostname \"$SCALR_HOSTNAME\""
 CMD="$CMD --scalr-token \"$SCALR_TOKEN\""
 CMD="$CMD --scalr-environment \"$SCALR_ENVIRONMENT\""
-CMD="$CMD --tfc-hostname \"$TFC_HOSTNAME\""
-CMD="$CMD --tfc-token \"$TFC_TOKEN\""
-CMD="$CMD --tfc-organization \"$TFC_ORGANIZATION\""
+CMD="$CMD --source-scalr-hostname \"$SOURCE_SCALR_HOSTNAME\""
+CMD="$CMD --source-scalr-token \"$SOURCE_SCALR_TOKEN\""
+CMD="$CMD --source-scalr-environment \"$SOURCE_SCALR_ENVIRONMENT\""
 [ -n "$SCALR_VCS_NAME" ] && CMD="$CMD --vcs-name \"$SCALR_VCS_NAME\""
 [ -n "$SCALR_PC_NAME" ] && CMD="$CMD --pc-name \"$SCALR_PC_NAME\""
 [ -n "$WORKSPACES" ] && CMD="$CMD -w \"$WORKSPACES\""
 [ "$SKIP_WORKSPACE_CREATION" = true ] && CMD="$CMD --skip-workspace-creation"
 [ "$SKIP_BACKEND_SECRETS" = true ] && CMD="$CMD --skip-backend-secrets"
-[ "$SKIP_TFC_LOCK" = true ] && CMD="$CMD --skip-tfc-lock"
+[ "$SKIP_SCALR_LOCK" = true ] && CMD="$CMD --skip-scalr-lock"
 [ -n "$MANAGEMENT_ENV_NAME" ] && CMD="$CMD --management-env-name \"$MANAGEMENT_ENV_NAME\""
 [ "$DISABLE_DELETION_PROTECTION" = true ] && CMD="$CMD --disable-deletion-protection"
-[ -n "$TFC_PROJECT" ] && CMD="$CMD --tfc-project \"$TFC_PROJECT\""
 [ -n "$SKIP_VARIABLES" ] && CMD="$CMD --skip-variables \"$SKIP_VARIABLES\""
 [ -n "$SCALR_AGENT_POOL_NAME" ] && CMD="$CMD --agent-pool-name \"$SCALR_AGENT_POOL_NAME\""
 
@@ -290,20 +276,7 @@ deactivate
 
 # Check if migration was successful
 if [ $? -eq 0 ]; then
-    echo "Migration completed successfully!"
-    
-    # Run post-migration script if it exists
-    echo "Starting post-migration steps..."
-
-    # Example: Navigate to the generated Terraform directory
-    terraform_dir="./generated-terraform/$SCALR_ENVIRONMENT"
-    cd "$terraform_dir" || exit 1
-
-    terraform fmt -list=false
-    terraform init
-    terraform apply
-
-    echo "Post-migration steps completed successfully!"
+    echo "Migration completed successfully! The code is generated to $PWD/generated-terraform "
 else
     echo "Migration failed. Please check the errors above."
     exit 1
