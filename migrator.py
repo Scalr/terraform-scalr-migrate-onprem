@@ -1173,15 +1173,19 @@ class MigrationService:
                 for var in configuration_variables:
                     if "sensitive" in configuration_variables[var]:
                         ConsoleOutput.info(f"Creating sensitive variable '{var}' from the plan file")
-                        response = self.dest_scalr.create_variable(
-                            var,
-                            variables[var]["value"],
-                            "terraform",
-                            True,
-                            skipped_sensitive_vars[var]["hcl"],
-                            skipped_sensitive_vars[var]["description"],
-                            relationships
-                        )
+                        try:
+                            response = self.dest_scalr.create_variable(
+                                var,
+                                variables[var]["value"],
+                                "terraform",
+                                True,
+                                skipped_sensitive_vars[var].get("hcl", False),
+                                skipped_sensitive_vars[var]["description"],
+                                relationships
+                            )
+                        except Exception as e:
+                            ConsoleOutput.warning(f"Failed to create sensitive variable '{var}': {e}")
+                            continue
 
                         var_resource = TerraformResource(
                             "scalr_variable",
