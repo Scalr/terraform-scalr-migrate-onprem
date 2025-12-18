@@ -475,10 +475,18 @@ class OnPremScalrClient(APIClient):
         }
         return self.get("workspaces", filters)
 
-    def get_workspace_vars(self, workspace_id: str) -> Dict:
+    def get_workspace_vars(self, workspace_id: str) -> List[Dict]:
         """Get workspace variables from on-prem Scalr."""
-        filters = {"filter[workspace]": workspace_id}
-        return self.get("vars", filters)
+        page = 1
+
+        all_variables = []
+        while page:
+            filters = {"filter[workspace]": workspace_id, "page[number]": page, "page[size]": 1}
+            variables = self.get("vars", filters)
+            page = variables["meta"]["pagination"]["next-page"]
+            all_variables += variables["data"]
+
+        return all_variables
 
     def get_workspace_runs(self, workspace_id: str, page_size: int = 1) -> Dict:
         """Get workspace runs from on-prem Scalr."""
@@ -1106,7 +1114,7 @@ class MigrationService:
         skipped_sensitive_vars = {}
         skip_patterns = self.args.skip_variables.split(',') if self.args.skip_variables else []
 
-        for api_var in self.source_scalr.get_workspace_vars(source_workspace["id"])["data"]:
+        for api_var in self.source_scalr.get_workspace_vars(source_workspace["id"]):
             attributes = api_var["attributes"]
             var_key: str = attributes["key"]
 
